@@ -28,6 +28,7 @@
 #include "Misc/PackageName.h"
 #include "Engine/Texture.h"
 #include "TextureResource.h"
+#include "TextureCompiler.h"
 #endif
 
 
@@ -121,260 +122,110 @@ void SetUseORM(UMaterialInstanceConstant* MaterialInstance, bool bUseORM)
 }
 
 
-static bool GetRawTextureData(UTexture2D* Texture, TArray<FColor>& OutPixels)
-{
-    if (!Texture) return false;
-
-    const int32 Width = Texture->GetSizeX();
-    const int32 Height = Texture->GetSizeY();
-
-    TArray64<uint8> RawData;
-    Texture->Source.GetMipData(RawData, 0);
-
-    OutPixels.SetNumUninitialized(Width * Height);
-    FMemory::Memcpy(OutPixels.GetData(), RawData.GetData(), RawData.Num());
-
-    return true;
-}
-
-UTexture2D* UPBRToORM::ConvertPBRToORM(FString AOFilePath, FString RoughnessFilePath, FString MetallicFilePath, const FString& SavePath)
+UTexture2D* UPBRToORM::ConvertPBRToORM(FString TexturePackagePath)
 {
 #if WITH_EDITOR
-    FString AOFileRelativePath = GetRelativePath(AOFilePath);
-    FString RoughnessFileRelativePath = GetRelativePath(RoughnessFilePath);
-    FString MetalicFileRelativePath = GetRelativePath(MetallicFilePath);
-    UTexture2D* AO = Cast<UTexture2D>(StaticLoadObject(UTexture2D::StaticClass(), nullptr, *AOFileRelativePath));
-    UTexture2D* Roughness = Cast<UTexture2D>(StaticLoadObject(UTexture2D::StaticClass(), nullptr, *RoughnessFileRelativePath));
-    UTexture2D* Metallic = Cast<UTexture2D>(StaticLoadObject(UTexture2D::StaticClass(), nullptr, *MetalicFileRelativePath));
+    FString AOPackagePath = TexturePackagePath + TEXT("/AO.AO");
+    FString RoughnessPackagePath = TexturePackagePath + TEXT("/Roughness.Roughness");
+    FString MetallicPackagePath = TexturePackagePath + TEXT("/Metalic.Metalic");
 
-    AO->CompressionSettings = TextureCompressionSettings::TC_VectorDisplacementmap;
-    AO->MipGenSettings = TextureMipGenSettings::TMGS_NoMipmaps;
-    AO->SRGB = false;
-    AO->UpdateResource();
-
-    Roughness->CompressionSettings = TextureCompressionSettings::TC_VectorDisplacementmap;
-    Roughness->MipGenSettings = TextureMipGenSettings::TMGS_NoMipmaps;
-    Roughness->SRGB = false;
-    Roughness->UpdateResource();
-
-    Metallic->CompressionSettings = TextureCompressionSettings::TC_VectorDisplacementmap;
-    Metallic->MipGenSettings = TextureMipGenSettings::TMGS_NoMipmaps;
-    Metallic->SRGB = false;
-    Metallic->UpdateResource();
+    UTexture2D* AO = Cast<UTexture2D>(StaticLoadObject(UTexture2D::StaticClass(), nullptr, *AOPackagePath));
+    UTexture2D* Roughness = Cast<UTexture2D>(StaticLoadObject(UTexture2D::StaticClass(), nullptr, *RoughnessPackagePath));
+    UTexture2D* Metallic = Cast<UTexture2D>(StaticLoadObject(UTexture2D::StaticClass(), nullptr, *MetallicPackagePath));
 
     if (!AO || !Roughness || !Metallic) return nullptr;
 
-    const int32 Width = AO->GetPlatformData()->SizeX;
-    const int32 Height = AO->GetPlatformData()->SizeX;
+    // Make sure all async texture compilation is finished before we touch Source
+    FTextureCompilingManager::Get().FinishAllCompilation();
 
-    UE_LOG(LogTemp, Error, TEXT("Surface Size - Width: %d, Height: %d"), Width, Height);
-
-    if (Roughness->GetSizeX() != Width || Metallic->GetSizeX() != Width)
+    const int32 Width = AO->GetSizeX();
+    const int32 Height = AO->GetSizeY();
+    if (Roughness->GetSizeX() != Width || Metallic->GetSizeX() != Width ||
+        Roughness->GetSizeY() != Height || Metallic->GetSizeY() != Height)
     {
-        UE_LOG(LogTemp, Error, TEXT("All textures must be same size."));
         return nullptr;
     }
+
     const int32 TotalPixels = Width * Height;
     const uint8* RoughData = Roughness->Source.LockMip(0);
     const uint8* MetalData = Metallic->Source.LockMip(0);
     const uint8* AOData = AO->Source.LockMip(0);
+
     if (!RoughData || !MetalData || !AOData)
     {
-        UE_LOG(LogTemp, Error,
-            TEXT("Failed to access source data of one or more textures."));
         Roughness->Source.UnlockMip(0);
         Metallic->Source.UnlockMip(0);
         AO->Source.UnlockMip(0);
         return nullptr;
     }
-    // Determine source pixel format for each (to handle bytes per pixel)
+
     ETextureSourceFormat roughFmt = Roughness->Source.GetFormat();
     ETextureSourceFormat metalFmt = Metallic->Source.GetFormat();
     ETextureSourceFormat aoFmt = AO->Source.GetFormat();
-    // Prepare buffer for combined texture pixels (4 bytes per pixel, BGRA8 format)
+
     TArray<uint8> CombinedPixels;
     CombinedPixels.AddUninitialized(TotalPixels * 4);
-    // Lambda to fetch a single grayscale value from source data (supports G8 or BGRA8 formats)
+
     auto GetGray = [&](const uint8* Data, ETextureSourceFormat Format, int32 index)->uint8
         {
             switch (Format)
             {
-            case TSF_G8: // 8-bit grayscale
-                return Data[index];
-            case TSF_G16: // 16-bit grayscale (take high byte as approximation)
-                return Data[index * 2];
-            case TSF_BGRA8: // 8-bit BGRA (use R channel)
-            case TSF_BGRE8:
-                return Data[index * 4 + 2]; // R channel of BGRA
-            default:
-                // For other formats, just return first byte (might not be valid in all cases)
-                return Data[index];
+            case TSF_G8: return Data[index];
+            case TSF_G16: return Data[index * 2];
+            case TSF_BGRA8:
+            case TSF_BGRE8: return Data[index * 4 + 2];
+            default: return Data[index];
             }
         };
-    // Loop through each pixel and assign combined channels: R=roughness, G = metallic, B = AO, A = 255
+
     for (int32 i = 0; i < TotalPixels; ++i)
     {
         uint8 roughVal = GetGray(RoughData, roughFmt, i);
         uint8 metalVal = GetGray(MetalData, metalFmt, i);
         uint8 aoVal = GetGray(AOData, aoFmt, i);
-        CombinedPixels[i * 4 + 2] = roughVal; // Red channel
-        CombinedPixels[i * 4 + 1] = metalVal; // Green channel
-        CombinedPixels[i * 4 + 0] = aoVal; // Blue channel
-        CombinedPixels[i * 4 + 3] = 0xFF; // Alpha channel (opaque)
-    }
-    UE_LOG(LogTemp, Error, TEXT("Pixeling"));
 
-    // Unlock source data arrays
+        CombinedPixels[i * 4 + 2] = roughVal;
+        CombinedPixels[i * 4 + 1] = metalVal;
+        CombinedPixels[i * 4 + 0] = aoVal;
+        CombinedPixels[i * 4 + 3] = 0xFF;
+    }
+
     Roughness->Source.UnlockMip(0);
     Metallic->Source.UnlockMip(0);
     AO->Source.UnlockMip(0);
 
-    UE_LOG(LogTemp, Error, TEXT("Creating the ORM texture"));
-    FString FolderPath = FPackageName::GetLongPackagePath(AOFileRelativePath);
+    FString FolderPath = FPackageName::GetLongPackagePath(AOPackagePath);
     FString FolderName = FPaths::GetCleanFilename(FolderPath);
-
     FString NewTexName = FolderName + TEXT("_ORM");
     FString NewTexPackagePath = FolderPath / NewTexName;
+
     UPackage* NewTexPackage = CreatePackage(*NewTexPackagePath);
     NewTexPackage->FullyLoad();
-    UTexture2D* NewORMTexture = NewObject<UTexture2D>(NewTexPackage, *NewTexName, RF_Public | RF_Standalone | RF_MarkAsRootSet);
 
-    // Initialize texture properties and allocate MIP data
-    NewORMTexture->AddToRoot(); // prevent garbage collection
+    UTexture2D* NewORMTexture = NewObject<UTexture2D>(NewTexPackage, *NewTexName, RF_Public | RF_Standalone);
+    NewORMTexture->PreEditChange(nullptr);
 
-
-
-    FTexturePlatformData* TexturePlatformData = new FTexturePlatformData();
-    TexturePlatformData->SizeX = Width;
-    TexturePlatformData->SizeY = Height;
-    //TexturePlatformData->NumSlices = 1;
-    TexturePlatformData->PixelFormat = PF_B8G8R8A8;
-
-    // Define os dados de plataforma da textura
-
-
-
-
-    //NewORMTexture->PlatformData = new FTexturePlatformData();
-    //NewORMTexture->PlatformData->SizeX = Width;
-    //NewORMTexture->PlatformData->SizeY = Height;
-    //NewORMTexture->PlatformData->NumSlices = 1;
-    //NewORMTexture->PlatformData->PixelFormat = PF_B8G8R8A8;
-
-
-    // Allocate first mipmap
-    FTexture2DMipMap* Mip = new FTexture2DMipMap();
-    Mip->SizeX = Width;
-    Mip->SizeY = Height;
-    Mip->BulkData.Lock(LOCK_READ_WRITE);
-    void* NewTexData = Mip->BulkData.Realloc(TotalPixels * 4);
-    FMemory::Memcpy(NewTexData, CombinedPixels.GetData(), TotalPixels * 4);
-    Mip->BulkData.Unlock();
-    TexturePlatformData->Mips.Add(Mip);
-
-    NewORMTexture->SetPlatformData(TexturePlatformData);
-
-    UE_LOG(LogTemp, Error, TEXT("Successfully set platformdata"));
-
+    NewORMTexture->Source.Init(Width, Height, 1, 1, TSF_BGRA8, CombinedPixels.GetData());
     NewORMTexture->SRGB = false;
     NewORMTexture->CompressionSettings = TC_Masks;
     NewORMTexture->MipGenSettings = TMGS_NoMipmaps;
-    // Initialize source art data for the texture asset (store uncompressed source pixels)
-    NewORMTexture->Source.Init(Width, Height, /*NumSlices=*/1, /*NumMips=*/1,
-        TSF_BGRA8, CombinedPixels.GetData());
-    NewORMTexture->UpdateResource();
 
-    UE_LOG(LogTemp, Error, TEXT("Created textures"));
-    // Save the new texture asset to Content Browser
+    NewORMTexture->PostEditChange();
+    NewORMTexture->MarkPackageDirty();
+
     FAssetRegistryModule::AssetCreated(NewORMTexture);
-    NewTexPackage->MarkPackageDirty();
-    FString FilePath =
-        FPackageName::LongPackageNameToFilename(NewTexPackagePath,
-            FPackageName::GetAssetPackageExtension());
+
+    FString FilePath = FPackageName::LongPackageNameToFilename(NewTexPackagePath, FPackageName::GetAssetPackageExtension());
     FSavePackageArgs SaveArgs;
     SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
     SaveArgs.Error = GError;
     SaveArgs.bWarnOfLongFilename = true;
     SaveArgs.SaveFlags = SAVE_NoError;
-    UPackage::SavePackage(NewTexPackage, NewORMTexture, *FilePath, SaveArgs); // save .uasset to disk
-    UE_LOG(LogTemp, Error, TEXT("Saved  the texture"));
+    UPackage::SavePackage(NewTexPackage, NewORMTexture, *FilePath, SaveArgs);
 
-    //auto GetPixels = [](UTexture2D* Tex) -> TArray<FColor>
-    //    {
-    //        TArray<FColor> Pixels;
-
-    //        if (!Tex || !Tex->GetPlatformData() || Tex->GetPlatformData()->Mips.Num() == 0)
-    //            return Pixels;
-
-    //        FTexture2DMipMap& Mip = Tex->GetPlatformData()->Mips[0];
-    //        void* Data = Mip.BulkData.Lock(LOCK_READ_ONLY);
-    //        if (Data)
-    //        {
-    //            FColor* FormattedData = static_cast<FColor*>(Data);
-    //            Pixels.Append(FormattedData, Tex->GetSizeX() * Tex->GetSizeY());
-    //        }
-    //        Mip.BulkData.Unlock();
-    //        return Pixels;
-    //    };
-
-    //TArray<FColor> AOPixels = GetPixels(AO);
-    //TArray<FColor> RoughnessPixels = GetPixels(Roughness);
-    //TArray<FColor> MetallicPixels = GetPixels(Metallic);
-
-    //UE_LOG(LogTemp, Error, TEXT("Successfully extracted pixel data from input textures."));
-
-    //if (AOPixels.Num() == 0 || RoughnessPixels.Num() == 0 || MetallicPixels.Num() == 0)
-    //{
-    //    UE_LOG(LogTemp, Error, TEXT("Failed to extract pixel data from input textures."));
-    //    return false;
-    //}
-
-    //UE_LOG(LogTemp, Error, TEXT("Prepring ORM structure"));
-
-    //TArray<FColor> ORMPixels;
-    //ORMPixels.SetNum(Width * Height);
-
-    //for (int32 i = 0; i < ORMPixels.Num(); ++i)
-    //{
-    //    ORMPixels[i] = FColor(AOPixels[i].R, RoughnessPixels[i].R, MetallicPixels[i].R, 255);
-    //}
-
-    //UE_LOG(LogTemp, Error, TEXT("Successfully created ORM texture"));
-
-    //// Convert to PNG
-    //IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-    //TSharedPtr<IImageWrapper> PNGWriter = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
-
-    //if (!PNGWriter.IsValid())
-    //{
-    //    UE_LOG(LogTemp, Error, TEXT("Failed to create PNG writer."));
-    //    return false;
-    //}
-
-    //PNGWriter->SetRaw(ORMPixels.GetData(), ORMPixels.GetAllocatedSize(), Width, Height, ERGBFormat::RGBA, 8);
-
-    //const TArray64<uint8>& PNGData = PNGWriter->GetCompressed();
-
-    //// Ensure directory exists
-    //IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-
-    //FString Directory = FPaths::GetPath(SavePath);
-    //if (!PlatformFile.DirectoryExists(*SavePath))
-    //{
-    //    PlatformFile.CreateDirectoryTree(*SavePath);
-    //}
-    //FString FilePAth = SavePath + FString("/MyORMTexture.png");
-    //if (FFileHelper::SaveArrayToFile(PNGData, *FilePAth))
-    //{
-    //    UE_LOG(LogTemp, Log, TEXT("Saved ORM texture to: %s"), *FilePAth);
-    //    return true;
-    //}
-    //else
-    //{
-    //    UE_LOG(LogTemp, Error, TEXT("Failed to save PNG to: %s"), *FilePAth);
-    //    return false;
-    //}
     return NewORMTexture;
+#else
+    return nullptr;
 #endif
 }
 
@@ -415,7 +266,47 @@ void UPBRToORM::ReplacePBRWithORMInMaterialInstance(UMaterialInstanceConstant * 
 #endif
 }
 
+TArray<UMaterialInstanceConstant*> UPBRToORM::GetMaterialInstancesFromTexture(FString TexturePath)
+{
+    TArray<UMaterialInstanceConstant*> Result;
+#if WITH_EDITOR
+    FString AOPackagePath = TexturePath + TEXT("/AO");
+    FName TexturePathName(*AOPackagePath);
+    FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+    IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
 
+    TArray<FName> ReferencerNames;
+
+	AssetRegistry.GetReferencers(TexturePathName, ReferencerNames, UE::AssetRegistry::EDependencyCategory::All);
+
+    for (FName& RefName : ReferencerNames)
+    {
+        FString RefString = RefName.ToString();
+
+        // Garantir que é PackageName.AssetName
+        if (!RefString.Contains(TEXT(".")))
+        {
+            FString AssetName = FPaths::GetCleanFilename(RefString);
+            RefString += TEXT(".") + AssetName;
+        }
+        FName CoorectedRefName(*RefString);
+
+        FAssetData RefData = AssetRegistryModule.Get().GetAssetByObjectPath(CoorectedRefName);
+        UE_LOG(LogTemp, Error, TEXT("AssetClass: %s"), *RefData.AssetClass.ToString());
+        
+        UMaterialInstanceConstant* MaterialInstance = Cast<UMaterialInstanceConstant>(StaticLoadObject(UMaterialInstanceConstant::StaticClass(), nullptr, *RefString));
+        if (MaterialInstance)
+        {
+              Result.Add(MaterialInstance);
+        }
+
+    }
+
+        
+    return Result;
+#endif
+    return Result;
+}
 
 
 
